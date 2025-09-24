@@ -1,0 +1,671 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 22 15:57:56 2025
+
+@author: admin
+"""
+
+"""
+改进版SHAP-RFE特征筛选：
+1. 预筛选阶段：采用方差和相关性过滤
+2. 增强SHAP-RFE：修复参数问题并优化特征移除策略
+3. 添加可视化评估工具
+"""
+import warnings, re
+warnings.filterwarnings('ignore')
+
+import json
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import lightgbm as lgb
+import optuna, shap
+import seaborn as sns
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, classification_report
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
+from lightgbm.callback import early_stopping
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+
+# In[] 1. 数据读取 & 预处理
+# ----------------------------------------------------------
+data = pd.read_csv('/home/zhouyou/prognosis/data_prognosis/discovery36ctrl-54case2227features90MD_scale.csv', index_col=0)
+X_train = data.iloc[:, :-1]
+y_train = data.iloc[:, -1]
+
+data_test = pd.read_csv('/home/zhouyou/prognosis/data_prognosis/valid6ctrl-18case2227features24MD_scale.csv', index_col=0)
+X_test = data_test.iloc[:, :-1]
+y_test = data_test.iloc[:, -1]
+
+# 统一安全列名
+def safe_cols(df):
+    df = df.copy()
+    df.columns = [re.sub(r'[^0-9a-zA-Z_]', '_', str(c)) for c in df.columns]
+    return df
+
+X_train = safe_cols(X_train)
+X_test = safe_cols(X_test)
+
+print(f"原始训练集形状: {X_train.shape}, 类别分布: {np.bincount(y_train)}")
+
+# 计算样本权重
+train_weights = compute_sample_weight("balanced", y_train)
+
+# ----------------------------------------------------------
+# In[] 2. 特征预筛选（多阶段筛选策略）
+# ----------------------------------------------------------
+def feature_preselection(X_train, X_test, y_train, threshold=0.01, corr_threshold=0.95, 
+                        alpha_fdr=0.05, verbose=True):
+    """
+    多阶段特征预筛选:
+    1. 方差阈值过滤
+    2. 高相关性特征过滤
+    3. 单变量统计筛选 (使用FDR控制)
+    
+    参数:
+        alpha_fdr: FDR检验的显著性水平，默认0.05
+    """
+    if verbose:
+        print("\n" + "="*60)
+        print("开始特征预筛选")
+        print("="*60)
+        print(f"原始特征数: {X_train.shape[1]}")
+    
+    # 方差阈值过滤
+    var_selector = VarianceThreshold(threshold=threshold)  ###var_selector是作为一个对象
+    X_train_var = var_selector.fit_transform(X_train)  ###计算方差，并根据阈值进行筛选
+    X_test_var = var_selector.transform(X_test)  ##筛选训练集中得到的特征
+    
+    # 转回DataFrame以保持列名
+    selected_features = X_train.columns[var_selector.get_support()]  
+    X_train_var_df = pd.DataFrame(X_train_var, columns=selected_features, index=X_train.index)
+    X_test_var_df = pd.DataFrame(X_test_var, columns=selected_features, index=X_test.index)
+    
+    if verbose:
+        print(f"方差阈值筛选后特征数: {X_train_var_df.shape[1]}")
+    
+    # 高相关性特征过滤
+    def remove_correlated_features(X, threshold=0.95):
+        corr_matrix = X.corr().abs() ##计算数值列之间的相关性
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))  ###保留上三角的特征
+        to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+        return X.drop(columns=to_drop), to_drop
+    
+    X_train_uncorr, dropped_corr = remove_correlated_features(X_train_var_df, threshold=corr_threshold)
+    X_test_uncorr = X_test_var_df.drop(columns=dropped_corr)
+    
+    if verbose: 
+        print(f"相关性筛选后特征数: {X_train_uncorr.shape[1]}")
+        print(f"移除的高相关特征数: {len(dropped_corr)}")
+    
+    # 单变量特征选择（使用FDR控制）
+    from sklearn.feature_selection import SelectFdr, f_classif
+    selector = SelectFdr(f_classif, alpha=alpha_fdr)   ####同第一步的方差筛选，也是赋值一个对象，然后应用于data中
+    X_train_uni = selector.fit_transform(X_train_uncorr, y_train)
+    X_test_uni = selector.transform(X_test_uncorr)
+    
+    # 转回DataFrame
+    selected_features = X_train_uncorr.columns[selector.get_support()]
+    X_train_final = pd.DataFrame(X_train_uni, columns=selected_features, index=X_train.index)
+    X_test_final = pd.DataFrame(X_test_uni, columns=selected_features, index=X_test.index)
+    
+    if verbose:
+        print(f"FDR统计筛选后特征数: {X_train_final.shape[1]} (α = {alpha_fdr})")
+    
+    if verbose:
+        print(f"预筛选后最终特征数: {X_train_final.shape[1]}")
+        
+    return X_train_final, X_test_final
+
+# 执行预筛选
+X_train_presel, X_test_presel = feature_preselection(X_train, X_test, y_train, alpha_fdr=0.05)
+
+# ----------------------------------------------------------
+# In[]3. 改进版SHAP-RFE
+# ----------------------------------------------------------
+class ImprovedShapRFECV:
+    """
+    改进版SHAP-RFE特征选择，有以下改进：
+    1. 适配LightGBM和XGBoost的不同参数
+    2. 增强批量特征移除策略
+    3. 更健壮的交叉验证
+    4. 可视化功能
+    """
+    def __init__(
+        self,
+        estimator_builder,
+        step_size=0.2,  # 每轮移除特征的百分比
+        min_features_to_select=20,
+        cv=5,
+        scoring="roc_auc",
+        random_state=42,
+        early_stopping_rounds=5,
+        verbose=1
+    ):
+        self.estimator_builder = estimator_builder
+        self.step_size = step_size  # 百分比而非固定数量
+        self.min_features_to_select = min_features_to_select
+        self.cv = cv
+        self.scoring = scoring
+        self.random_state = random_state
+        self.early_stopping_rounds = early_stopping_rounds
+        self.verbose = verbose
+
+    def fit(self, X, y, sample_weight=None):
+        self.feature_names_ = X.columns.tolist()
+        current_features = self.feature_names_.copy()
+        self.cv_results_ = []
+        self.n_features_ = []
+        self.importance_history_ = []
+        
+        # 早停相关
+        best_score = 0
+        no_improve_count = 0
+        best_features = current_features.copy()
+
+        # 交叉验证划分
+        skf = StratifiedKFold(
+            n_splits=self.cv, shuffle=True, random_state=self.random_state
+        )
+        
+        if self.verbose:
+            print("\n" + "="*60)
+            print("开始改进版SHAP-RFE特征筛选")
+            print("="*60)
+
+        while len(current_features) > self.min_features_to_select:
+            # 根据当前特征数量动态确定每轮要移除的特征数
+            n_to_drop = max(
+                1,  # 至少移除1个
+                min(
+                    int(len(current_features) * self.step_size),  # 按百分比移除
+                    len(current_features) - self.min_features_to_select  # 但不超过允许的最小特征数
+                )
+            )
+            
+            # 在移除特征前评估当前特征集性能
+            auc_scores = []
+            for train_idx, val_idx in skf.split(X, y):
+                X_fold_train = X.iloc[train_idx][current_features]
+                y_fold_train = y.iloc[train_idx]
+                
+                # 处理样本权重
+                if sample_weight is not None:
+                    w_fold_train = sample_weight[train_idx]
+                else:
+                    w_fold_train = None
+
+                X_fold_val = X.iloc[val_idx][current_features]
+                y_fold_val = y.iloc[val_idx]
+
+                model = self.estimator_builder()
+                
+                # 适配XGBoost和LightGBM的不同拟合参数
+                if hasattr(model, 'fit'):
+                    fit_kwargs = {}
+                    if 'sample_weight' in model.fit.__code__.co_varnames and w_fold_train is not None:
+                        fit_kwargs['sample_weight'] = w_fold_train
+                    
+                    # 区分不同模型类型的verbose参数
+                    if isinstance(model, xgb.XGBModel) and 'verbose' in model.fit.__code__.co_varnames:
+                        fit_kwargs['verbose'] = False
+                    elif isinstance(model, lgb.LGBMModel) and 'verbose_eval' in model.fit.__code__.co_varnames:
+                        fit_kwargs['verbose_eval'] = False
+                    elif isinstance(model, lgb.LGBMModel) and 'verbose' in model.fit.__code__.co_varnames:
+                        fit_kwargs['verbose'] = -1  # LightGBM用-1表示静默模式
+                    
+                    model.fit(X_fold_train, y_fold_train, **fit_kwargs)
+                else:
+                    model.fit(X_fold_train, y_fold_train)
+
+                # 获取预测概率
+                if hasattr(model, 'predict_proba'):
+                    preds = model.predict_proba(X_fold_val)[:, 1]
+                else:
+                    preds = model.predict(X_fold_val)
+                    
+                auc_scores.append(roc_auc_score(y_fold_val, preds))
+
+            mean_auc = np.mean(auc_scores)
+            std_auc = np.std(auc_scores)
+            self.cv_results_.append(mean_auc)
+            self.n_features_.append(len(current_features))
+            
+            if self.verbose:
+                print(f"特征数量: {len(current_features):4d}  |  CV AUC: {mean_auc:.4f} ± {std_auc:.4f}")
+            
+            # 早停检查和最佳特征更新
+            if mean_auc > best_score:
+                best_score = mean_auc
+                best_features = current_features.copy()
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                if no_improve_count >= self.early_stopping_rounds:
+                    if self.verbose:
+                        print(f"早停触发: {self.early_stopping_rounds}轮无改善")
+                    break
+
+            # 计算SHAP重要性
+            full_model = self.estimator_builder()
+            
+            # 统一样本权重处理
+            if sample_weight is not None and hasattr(full_model, 'fit'):
+                fit_kwargs = {}
+
+                # 只在模型可以接受的时候添加sample_weight
+                if 'sample_weight' in full_model.fit.__code__.co_varnames:
+                    fit_kwargs['sample_weight'] = sample_weight
+                # 只在XGBoost模型中设置verbose参数
+                if isinstance(full_model, xgb.XGBModel) and 'verbose' in full_model.fit.__code__.co_varnames:
+                    fit_kwargs['verbose'] = False
+                elif isinstance(full_model, lgb.LGBMModel) and 'verbose_eval' in full_model.fit.__code__.co_varnames:
+                    fit_kwargs['verbose_eval'] = False
+                # 使用正确的参数fit
+                full_model.fit(X[current_features], y, **fit_kwargs)
+            else:
+                full_model.fit(X[current_features], y)
+            
+            # SHAP稳定性处理：使用子样本计算SHAP值
+            if len(X) > 500:  # 大数据集下采样
+                sample_size = min(500, len(X))
+                sample_indices = np.random.choice(len(X), sample_size, replace=False)
+                X_shap = X[current_features].iloc[sample_indices]
+            else:
+                X_shap = X[current_features]
+                
+            # 特征重要性计算与模型类型适配
+            try:
+                # 首先尝试树模型SHAP解释器
+                explainer = shap.TreeExplainer(full_model)
+                shap_values = explainer.shap_values(X_shap)
+                
+                # 处理不同模型的SHAP值格式
+                if isinstance(shap_values, list):
+                    # XGBoost二分类返回的是[negative_class, positive_class]
+                    shap_vals = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                else:
+                    # LightGBM直接返回ndarray
+                    shap_vals = shap_values
+            except:
+                # 如果树模型解释器失败，尝试通用Kernel解释器
+                try:
+                    explainer = shap.KernelExplainer(
+                        lambda x: full_model.predict_proba(x)[:, 1], 
+                        X_shap.iloc[:100]  # 使用更小的背景集
+                    )
+                    shap_vals = explainer.shap_values(X_shap.iloc[:100])
+                except:
+                    # 如果SHAP失败，回退到模型自带的特征重要性
+                    if hasattr(full_model, 'feature_importances_'):
+                        importance = full_model.feature_importances_
+                    else:
+                        # 最后手段：随机选择特征
+                        importance = np.random.random(len(current_features))
+                        print("警告: 无法计算SHAP值，使用随机重要性")
+            
+            # 如果成功计算了SHAP值
+            if 'shap_vals' in locals():
+                importance = np.abs(shap_vals).mean(axis=0)
+            
+            # 记录特征重要性
+            imp_df = pd.Series(importance, index=current_features)
+            self.importance_history_.append(imp_df)
+            
+            # 按重要性升序排序并选择最不重要的n_to_drop个特征移除
+            to_drop = imp_df.sort_values().head(n_to_drop).index.tolist()
+            current_features = [f for f in current_features if f not in to_drop]
+
+        # 使用最佳特征集
+        self.selected_features_ = best_features
+        self.support_ = np.array([f in self.selected_features_ for f in self.feature_names_])
+        
+        if self.verbose:
+            print(f"\n最佳特征数量: {len(self.selected_features_)}, 最佳CV AUC: {best_score:.4f}")
+        
+        # 绘制特征选择过程中的性能变化
+        if self.verbose:
+            self._plot_cv_results()
+            
+        return self
+
+    def transform(self, X):
+        return X[self.selected_features_]
+    
+    def _plot_cv_results(self):
+        """绘制特征选择过程中的性能变化"""
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.n_features_, self.cv_results_, 'o-')
+        plt.xlabel('Feature Number')
+        plt.ylabel('CV AUC Score')
+        plt.title('SHAP-RFE feature selection performance curve')
+        plt.grid(True, alpha=0.3)
+        
+        # 标记最佳点
+        best_idx = np.argmax(self.cv_results_)
+        best_n = self.n_features_[best_idx]
+        best_score = self.cv_results_[best_idx]
+        plt.scatter([best_n], [best_score], c='r', s=100, zorder=10)
+        plt.annotate(f'Best: {best_n} features, AUC={best_score:.4f}',
+                    (best_n, best_score), 
+                    xytext=(10, -20),
+                    textcoords='offset points',
+                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
+        
+        plt.tight_layout()
+        # plt.savefig('/home/zhouyou/prognosis/shap_rfe_performance.png', dpi=300)
+        plt.show()
+
+# ----------------------------------------------------------
+# In[]4. 构建适合LightGBM的基础模型
+# ----------------------------------------------------------
+def build_lgb_base():
+    """创建适合LightGBM的基础模型，注意参数兼容性"""
+    return lgb.LGBMClassifier(
+        n_estimators=100,
+        learning_rate=0.05,
+        max_depth=3,  # 树深度适中，避免过拟合
+        min_child_weight=3,  # LightGBM使用min_child_samples
+        min_child_samples=5,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
+        objective='binary',
+        metric='auc',
+        random_state=RANDOM_STATE,
+        verbose=-1
+    )
+
+# ----------------------------------------------------------
+# In[] 5. 执行改进版SHAP-RFE
+# ----------------------------------------------------------
+# 用预筛选后的特征进行SHAP-RFE
+selector = ImprovedShapRFECV(
+    estimator_builder=build_lgb_base,
+    step_size=0.2,  # 每轮移除20%的特征
+    min_features_to_select=5,
+    cv=5,
+    scoring="roc_auc",
+    random_state=RANDOM_STATE,
+    early_stopping_rounds=3,
+    verbose=1
+)
+
+selector.fit(X_train_presel, y_train, sample_weight=train_weights)
+
+X_train_sel = selector.transform(X_train_presel)
+X_test_sel = selector.transform(X_test_presel)
+
+# Save the selected features to csv
+selected_features_df = pd.DataFrame({'feature_name': selector.selected_features_})
+selected_features_df.to_csv('/home/zhouyou/prognosis/LGBM_feature.csv', index=False)
+print(f"Selected features saved to LGBM_feature.csv ({len(selector.selected_features_)} features)")
+
+print(f"\n最终特征筛选: {X_train.shape[1]} → {X_train_presel.shape[1]} → {X_train_sel.shape[1]}")
+
+# ----------------------------------------------------------
+# In[] 6. Optuna优化LightGBM
+# ----------------------------------------------------------
+def objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int('n_estimators', 100, 500),
+        learning_rate=trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        max_depth=trial.suggest_int('max_depth', 3, 8),
+        num_leaves=trial.suggest_int('num_leaves', 16, 64),  
+        min_child_samples=trial.suggest_int('min_child_samples', 5, 30),  
+        subsample=trial.suggest_float('subsample', 0.6, 0.9),
+        colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 0.9),
+        reg_alpha=trial.suggest_float('reg_alpha', 0.01, 1.0, log=True),
+        reg_lambda=trial.suggest_float('reg_lambda', 0.01, 1.0, log=True),
+        min_split_gain=trial.suggest_float('min_split_gain', 0.01, 0.5),  
+        objective='binary',
+        metric='auc',
+        is_unbalance=True,  
+        random_state=RANDOM_STATE,
+        verbose=-1
+    )
+    
+    # 使用分层K折交叉验证
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    aucs = []
+    
+    for tr_idx, va_idx in skf.split(X_train_sel, y_train):
+        X_fold_train = X_train_sel.iloc[tr_idx]
+        y_fold_train = y_train.iloc[tr_idx]
+        w_fold_train = train_weights[tr_idx]
+        
+        X_fold_val = X_train_sel.iloc[va_idx]
+        y_fold_val = y_train.iloc[va_idx]
+        
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_fold_train, y_fold_train,
+            sample_weight=w_fold_train,
+            eval_set=[(X_fold_val, y_fold_val)],
+            callbacks=[early_stopping(stopping_rounds=50)]
+        )
+        
+        preds = model.predict_proba(X_fold_val)[:, 1]
+        aucs.append(roc_auc_score(y_fold_val, preds))
+    
+    return np.mean(aucs)
+
+print("\n" + "="*60)
+print("开始贝叶斯超参数优化")
+print("="*60)
+
+study = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE)
+)
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+
+print("\n最优参数:")
+for k, v in study.best_params.items():
+    print(f"{k:20s}: {v}")
+
+# ----------------------------------------------------------
+# In[]7. 最终模型训练与评估 (使用LightGBM)
+# ----------------------------------------------------------
+best_params = study.best_params.copy()
+best_params.update(dict(
+    objective='binary',
+    metric='auc',
+    is_unbalance=True,  # 替代scale_pos_weight
+    random_state=RANDOM_STATE,
+    verbose=-1
+))
+
+# 手动增强正则化，防止过拟合
+reg_strength = 0.8  # 调整正则化强度
+best_params.update(dict(
+    reg_alpha=max(best_params['reg_alpha'], reg_strength),
+    reg_lambda=max(best_params['reg_lambda'], reg_strength),
+    max_depth=min(best_params['max_depth'], 4),  # 限制树深度
+    subsample=min(best_params['subsample'], 0.8),  # 限制样本采样率
+    colsample_bytree=min(best_params['colsample_bytree'], 0.8),  # 限制特征采样率
+    num_leaves=min(best_params.get('num_leaves', 31), 31)  # 限制叶子节点数
+))
+
+final_model = lgb.LGBMClassifier(**best_params)
+
+final_model.fit(
+    X_train_sel, y_train,
+    sample_weight=train_weights,
+    eval_set=[(X_train_sel, y_train), (X_test_sel, y_test)],
+    eval_names=['train', 'test'],
+    callbacks=[early_stopping(stopping_rounds=50)]
+)
+
+# ----------------------------------------------------------
+# In[] 8. 保存当前流程全部参数为json文件
+# ----------------------------------------------------------
+# Collect all parameters used in the pipeline
+pipeline_params = {
+    "preprocessing": {
+        "variance_threshold": 0.01,
+        "correlation_threshold": 0.95,
+        "fdr_alpha": 0.05
+    },
+    "shap_rfe": {
+        "step_size": 0.2,
+        "min_features_to_select": 5,
+        "cv": 5,
+        "early_stopping_rounds": 3,
+        "random_state": RANDOM_STATE
+    },
+    "lightgbm": best_params,
+    "feature_counts": {
+        "original": X_train.shape[1],
+        "after_preselection": X_train_presel.shape[1],
+        "final_selected": X_train_sel.shape[1]
+    },
+    "data_info": {
+        "train_samples": X_train.shape[0],
+        "test_samples": X_test.shape[0],
+        "class_distribution_train": np.bincount(y_train).tolist()
+    }
+}
+
+# Save parameters to JSON
+with open('/home/zhouyou/prognosis/LGBM_params.json', 'w') as f:
+    json.dump(pipeline_params, f, indent=4)
+
+print("Pipeline parameters saved to LGBM_params.json")
+
+# ----------------------------------------------------------
+# In[]9. 改进的评估与可视化
+# ----------------------------------------------------------
+def evaluate_model(model, X_train, y_train, X_test, y_test):
+    """全面评估模型性能并生成可视化"""
+    # 预测结果
+    y_train_prob = model.predict_proba(X_train)[:, 1]
+    y_test_prob = model.predict_proba(X_test)[:, 1]
+    
+    # 找到最佳阈值（基于训练集F1分数）
+    from sklearn.metrics import f1_score, precision_recall_curve
+    precision, recall, thresholds = precision_recall_curve(y_train, y_train_prob)
+    f1_scores = 2 * recall * precision / (recall + precision + 1e-10)
+    best_threshold = thresholds[np.argmax(f1_scores)]
+    
+    # 使用最佳阈值进行二分类预测
+    y_train_pred = (y_train_prob >= best_threshold).astype(int)
+    y_test_pred = (y_test_prob >= best_threshold).astype(int)
+    
+    # 计算各种评估指标
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report
+    
+    train_metrics = {
+        'accuracy': accuracy_score(y_train, y_train_pred),
+        'precision': precision_score(y_train, y_train_pred),
+        'recall': recall_score(y_train, y_train_pred),
+        'f1': f1_score(y_train, y_train_pred),
+        'auc': roc_auc_score(y_train, y_train_prob),
+        'cm': confusion_matrix(y_train, y_train_pred)
+    }
+    
+    test_metrics = {
+        'accuracy': accuracy_score(y_test, y_test_pred),
+        'precision': precision_score(y_test, y_test_pred),
+        'recall': recall_score(y_test, y_test_pred),
+        'f1': f1_score(y_test, y_test_pred),
+        'auc': roc_auc_score(y_test, y_test_prob),
+        'cm': confusion_matrix(y_test, y_test_pred)
+    }
+    
+    # 打印评估结果
+    print("\n" + "="*60)
+    print("模型评估结果 (阈值 = {:.3f})".format(best_threshold))
+    print("="*60)
+    
+    print("训练集指标:")
+    print(f"  准确率(Accuracy): {train_metrics['accuracy']:.4f}")
+    print(f"  精确率(Precision): {train_metrics['precision']:.4f}")
+    print(f"  召回率(Recall): {train_metrics['recall']:.4f}")
+    print(f"  F1分数: {train_metrics['f1']:.4f}")
+    print(f"  ROC-AUC: {train_metrics['auc']:.4f}")
+    
+    print("\n测试集指标:")
+    print(f"  准确率(Accuracy): {test_metrics['accuracy']:.4f}")
+    print(f"  精确率(Precision): {test_metrics['precision']:.4f}")
+    print(f"  召回率(Recall): {test_metrics['recall']:.4f}")
+    print(f"  F1分数: {test_metrics['f1']:.4f}")
+    print(f"  ROC-AUC: {test_metrics['auc']:.4f}")
+    
+    # 过拟合评估
+    auc_gap = train_metrics['auc'] - test_metrics['auc']
+    print("\n过拟合评估:")
+    if auc_gap > 0.1:
+        print(f"⚠️ 严重过拟合 (AUC差: {auc_gap:.4f})")
+    elif auc_gap > 0.05:
+        print(f"⚠️ 轻微过拟合 (AUC差: {auc_gap:.4f})")
+    else:
+        print(f"✅ 模型泛化良好 (AUC差: {auc_gap:.4f})")
+    
+    # 分类报告
+    print("\n训练集分类报告:")
+    print(classification_report(y_train, y_train_pred, digits=4))
+    
+    print("\n测试集分类报告:")
+    print(classification_report(y_test, y_test_pred, digits=4))
+    
+    # 绘制ROC曲线
+    plt.figure(figsize=(10, 6))
+    
+    from sklearn.metrics import roc_curve
+    train_fpr, train_tpr, _ = roc_curve(y_train, y_train_prob)
+    test_fpr, test_tpr, _ = roc_curve(y_test, y_test_prob)
+    
+    plt.plot(train_fpr, train_tpr, 'b-', label=f'Train AUC: {train_metrics["auc"]:.4f}')
+    plt.plot(test_fpr, test_tpr, 'r-', label=f'Test AUC: {test_metrics["auc"]:.4f}')
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Guessing')
+
+    plt.xlabel('False Positive Rate (FPR)')
+    plt.ylabel('True Positive Rate (TPR)')
+    plt.title('ROC Curve')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    
+    # 绘制特征重要性
+    feature_imp = pd.DataFrame({
+        'feature': X_train.columns,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    top_n = min(20, len(feature_imp))
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x='importance', y='feature', data=feature_imp.head(top_n))
+    plt.title(f'Top {top_n} feature importance')
+    plt.tight_layout()
+    
+    return {
+        'train': train_metrics,
+        'test': test_metrics,
+        'best_threshold': best_threshold,
+        'feature_importance': feature_imp
+    }
+
+# 评估最终模型
+results = evaluate_model(final_model, X_train_sel, y_train, X_test_sel, y_test)
+# 保存最终模型
+with open('/home/zhouyou/prognosis/LGBM.pkl', 'wb') as f:
+    pickle.dump(final_model, f)
+print("模型已保存到LGBM.pkl")
+
+print("\n" + "="*60)
+print("特征筛选与模型训练完成！")
+print("="*60)
+print(f"原始特征数: {X_train.shape[1]}")
+print(f"预筛选后特征数: {X_train_presel.shape[1]}")
+print(f"SHAP-RFE后特征数: {X_train_sel.shape[1]}")
+print(f"特征减少比例: {(1 - X_train_sel.shape[1]/X_train.shape[1])*100:.1f}%")
