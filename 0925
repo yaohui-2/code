@@ -1,0 +1,62 @@
+rm(list = ls())
+file_path <- "E:\\westlake\\WOSP24154\\11_补充分析\\7_ecm_violin_plot\\plot_datav2_副本.xlsx"  # 替换为您的文件路径
+sheets <- excel_sheets(file_path)
+#sheet_list <- c("SPP1","APOC2","PLA2G7","CD36")
+#sheet_list <- c("ITLN1")
+for(sheet in sheets){
+  if(sheet %in% sheets){
+    data <- read_xlsx(file_path, sheet = sheet)
+    data$type <- factor(data$type,levels = c("cluster5","cluster7"))
+    data$group <- factor(data$group,levels = c("H","E","M","L"))
+    #data$gene <- as.numeric(scale(data$gene))
+    ymin <- min(data$gene, na.rm = TRUE)
+    ymax <- max(data$gene, na.rm = TRUE)
+    gg <- data %>%
+      ggplot(aes(x = group, y = gene)) +
+      # 背景着色区域
+      #annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2, 
+              # fill = "cornflowerblue", alpha = 0.3, color = NA) +
+      #annotate("rect", xmin = -Inf, xmax = Inf, ymin = 2, ymax = Inf, 
+              # fill = "#FCAE12", alpha = 0.3, color = NA) +
+      # 分布图表
+      geom_violin(aes(fill = type), trim = FALSE, show.legend = FALSE) +
+      geom_boxplot(width = 0.1, outliers = FALSE, staplewidth = 0.5) +
+      stat_summary(fun = mean, geom = "point", 
+                   color = "black", fill = "#F98400", 
+                   shape = 23, size = 3, show.legend = FALSE) +
+      stat_summary(fun = mean, geom = "line", 
+                   aes(group = type), color = "black") +
+      stat_compare_means(aes(group = group), 
+                         method = "anova", 
+                         label = "p.signif",    # 显示星号或者“ns”
+                         hide.ns = FALSE,
+                         tip.length = 0,
+                         position = position_nudge(x = 1),
+                         size = 6) +
+      theme(
+        # 文本设置
+        axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5,  color = "black", size = 10),
+        axis.text.y = element_text(color = "black", size = 9),
+        axis.title.y = element_text(size = 11, margin = margin(r = 10)),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 10),
+        # 背景和网格
+        plot.background = element_rect(fill = "white", color = NA), 
+        panel.background = element_rect(fill = "white", color = "grey80"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        # 边距和间距
+        panel.spacing.x = unit(0.25, "cm"),
+        plot.margin = unit(c(1, 1, 1, 1), "cm"),
+        # 坐标轴线
+        axis.line.x = element_line(color = "black"),
+        axis.line.y.left = element_line(color = "grey30"),
+        axis.line.y.right = element_line(color = "grey30")
+      )+
+      scale_y_continuous(
+        sec.axis = sec_axis(~ ., name = "", breaks = NULL)
+      ) 
+    
+    ggsave(filename = paste0("E:\\westlake\\WOSP24154\\11_补充分析\\7_ecm_violin_plot\\", sheet, "_3.pdf"), plot = gg, width = 6, height = 4, dpi = 300)
+  }
+}
